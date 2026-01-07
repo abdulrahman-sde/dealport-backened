@@ -1,0 +1,48 @@
+import { z } from "zod";
+export const numericString = (fieldName = "field") => {
+    return z.preprocess((val) => {
+        if (val === undefined || val === null || val === "") {
+            return undefined;
+        }
+        const num = Number(val);
+        return isNaN(num) ? undefined : num;
+    }, z.number({
+        message: `${fieldName} must be a valid number`,
+    }));
+};
+export const optionalNumericString = (fieldName = "field", defaultValue) => {
+    return z.preprocess((val) => {
+        if (val === undefined || val === null || val === "") {
+            return defaultValue;
+        }
+        const num = Number(val);
+        return isNaN(num) ? defaultValue : num;
+    }, z.number({
+        message: `${fieldName} must be a valid number`,
+    }));
+};
+export const safeNumber = (fieldName = "field") => {
+    return z.preprocess((val) => {
+        if (val === undefined || val === null || val === "") {
+            return undefined;
+        }
+        const num = Number(val);
+        return isNaN(num) ? undefined : num;
+    }, z.number({
+        message: `${fieldName} must be a valid number`,
+    }));
+};
+export const paginationSchema = z.object({
+    page: optionalNumericString("page", 1).pipe(z.number().int().min(1, "Page must be at least 1")),
+    limit: optionalNumericString("limit", 10).pipe(z
+        .number()
+        .int()
+        .min(1, "Limit must be at least 1")
+        .max(100, "Limit cannot exceed 100")),
+});
+export const enumField = (values, fieldName = "field") => {
+    return z.enum(values, {
+        message: `${fieldName} must be one of: ${values.join(", ")}`,
+    });
+};
+//# sourceMappingURL=helpers.js.map
