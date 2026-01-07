@@ -1,0 +1,768 @@
+import type { Prisma } from "@prisma/client";
+import { prisma } from "../lib/prisma.js";
+import { redis } from "../config/redis.js";
+import type {
+  RawOrderMetrics,
+  RawProductMetrics,
+  RawSessionMetrics,
+} from "../types/job.types.js";
+
+export const analyticsRepository = {
+  async getOrderMetrics(startOfDay: Date, endOfDay: Date) {
+    const rawOrderMetrics = (await prisma.order.aggregateRaw({
+      pipeline: [
+        {
+          $match: {
+            createdAt: {
+              $gte: { $date: startOfDay.toISOString() },
+              $lt: { $date: endOfDay.toISOString() },
+            },
+          },
+        },
+        {
+          $lookup: {
+            from: "customers",
+            localField: "customerId",
+            foreignField: "_id",
+            as: "customerInfo",
+          },
+        },
+        { $unwind: "$customerInfo" },
+        {
+          $facet: {
+            totalStats: [
+              {
+                $group: {
+                  _id: null,
+                  totalOrders: { $sum: 1 },
+                  totalSales: { $sum: "$totalAmount" },
+                },
+              },
+            ],
+            completedOrders: [
+              { $match: { fulfillmentStatus: "DELIVERED" } },
+              { $count: "count" },
+            ],
+            cancelledOrders: [
+              { $match: { fulfillmentStatus: "CANCELED" } },
+              { $count: "count" },
+            ],
+            pendingOrders: [
+              { $match: { fulfillmentStatus: "PENDING" } },
+              { $count: "count" },
+            ],
+            processingOrders: [
+              { $match: { fulfillmentStatus: "PROCESSING" } },
+              { $count: "count" },
+            ],
+            shippedOrders: [
+              { $match: { fulfillmentStatus: "SHIPPED" } },
+              { $count: "count" },
+            ],
+            newOrders: [
+              {
+                $match: {
+                  "customerInfo.createdAt": {
+                    $gte: { $date: startOfDay.toISOString() },
+                  },
+                },
+              },
+              { $count: "count" },
+            ],
+            returningCustomers: [
+              {
+                $match: {
+                  "customerInfo.createdAt": {
+                    $lt: { $date: startOfDay.toISOString() },
+                  },
+                },
+              },
+              { $group: { _id: "$customerId" } },
+              { $count: "count" },
+            ],
+          },
+        },
+        {
+          $project: {
+            totalOrders: { $arrayElemAt: ["$totalStats.totalOrders", 0] },
+            totalSales: { $arrayElemAt: ["$totalStats.totalSales", 0] },
+            completedOrders: { $arrayElemAt: ["$completedOrders.count", 0] },
+            cancelledOrders: { $arrayElemAt: ["$cancelledOrders.count", 0] },
+            pendingOrders: { $arrayElemAt: ["$pendingOrders.count", 0] },
+            processingOrders: { $arrayElemAt: ["$processingOrders.count", 0] },
+            shippedOrders: { $arrayElemAt: ["$shippedOrders.count", 0] },
+            newOrders: { $arrayElemAt: ["$newOrders.count", 0] },
+            returningCustomers: {
+              $arrayElemAt: ["$returningCustomers.count", 0],
+            },
+          },
+        },
+      ],
+    })) as unknown as RawOrderMetrics[];
+
+    const metrics = rawOrderMetrics[0] || {};
+
+    return {
+      totalOrders: Number(metrics.totalOrders || 0),
+      totalSales: Number(metrics.totalSales || 0),
+      completedOrders: Number(metrics.completedOrders || 0),
+      cancelledOrders: Number(metrics.cancelledOrders || 0),
+      pendingOrders: Number(metrics.pendingOrders || 0),
+      processingOrders: Number(metrics.processingOrders || 0),
+      shippedOrders: Number(metrics.shippedOrders || 0),
+      newOrders: Number(metrics.newOrders || 0),
+      returningCustomers: Number(metrics.returningCustomers || 0),
+    };
+  },
+
+  async getProductMetrics() {
+    const result = (await prisma.product.aggregateRaw({
+      pipeline: [
+        { $match: { deletedAt: null } },
+        {
+          $facet: {
+            total: [{ $count: "count" }],
+            inStock: [
+              { $match: { stockQuantity: { $gt: 0 } } },
+              { $count: "count" },
+            ],
+            outOfStock: [
+              { $match: { stockQuantity: { $lte: 0 } } },
+              { $count: "count" },
+            ],
+          },
+        },
+        {
+          $project: {
+            total: { $arrayElemAt: ["$total.count", 0] },
+            inStock: { $arrayElemAt: ["$inStock.count", 0] },
+            outOfStock: { $arrayElemAt: ["$outOfStock.count", 0] },
+          },
+        },
+      ],
+    })) as unknown as Array<{
+      total?: number;
+      inStock?: number;
+      outOfStock?: number;
+    }>;
+
+    const r = result[0] || {};
+    return {
+      totalProducts: Number(r.total ?? 0),
+      inStockProducts: Number(r.inStock ?? 0),
+      outOfStockProducts: Number(r.outOfStock ?? 0),
+    };
+  },
+
+  async getNewCustomersCount(startOfDay: Date, endOfDay: Date) {
+    return prisma.customer.count({
+      where: {
+        createdAt: { gte: startOfDay, lt: endOfDay },
+        deletedAt: null,
+      },
+    });
+  },
+
+  async getTotalCustomersCount() {
+    return prisma.customer.count({
+      where: { deletedAt: null },
+    });
+  },
+
+  async getSessionMetrics(startOfDay: Date, endOfDay: Date) {
+    const [
+      rawSessionMetrics,
+      totalPageViews,
+      addToCartCount,
+      checkoutStartedCount,
+      convertedSessions,
+    ] = await Promise.all([
+      prisma.session.aggregateRaw({
+        pipeline: [
+          {
+            $match: {
+              startedAt: {
+                $gte: { $date: startOfDay.toISOString() },
+                $lt: { $date: endOfDay.toISOString() },
+              },
+            },
+          },
+          {
+            $facet: {
+              totalVisits: [{ $count: "count" }],
+              uniqueVisits: [
+                { $group: { _id: "$visitorId" } },
+                { $count: "count" },
+              ],
+              convertedSessions: [
+                { $match: { converted: true } },
+                { $count: "count" },
+              ],
+            },
+          },
+          {
+            $project: {
+              totalVisits: { $arrayElemAt: ["$totalVisits.count", 0] },
+              uniqueVisits: { $arrayElemAt: ["$uniqueVisits.count", 0] },
+              convertedSessions: {
+                $arrayElemAt: ["$convertedSessions.count", 0],
+              },
+            },
+          },
+        ],
+      }),
+
+      prisma.sessionEvent.count({
+        where: {
+          timestamp: { gte: startOfDay, lt: endOfDay },
+          eventType: "page_view",
+        },
+      }),
+
+      prisma.sessionEvent.count({
+        where: {
+          timestamp: { gte: startOfDay, lt: endOfDay },
+          eventType: "add_to_cart",
+        },
+      }),
+
+      prisma.sessionEvent.count({
+        where: {
+          timestamp: { gte: startOfDay, lt: endOfDay },
+          eventType: "checkout_started",
+        },
+      }),
+
+      prisma.session.count({
+        where: {
+          startedAt: { gte: startOfDay, lt: endOfDay },
+          converted: true,
+        },
+      }),
+    ]);
+
+    const sessionStats =
+      (rawSessionMetrics as unknown as RawSessionMetrics[])[0] || {};
+
+    const converted = Number(
+      sessionStats.convertedSessions ?? convertedSessions ?? 0
+    );
+
+    return {
+      totalVisits: Number(sessionStats.totalVisits || 0),
+      uniqueVisits: Number(sessionStats.uniqueVisits || 0),
+      totalPageViews,
+      addToCartCount: Number(addToCartCount),
+      checkoutStartedCount: Number(checkoutStartedCount),
+      convertedSessions: converted,
+    };
+  },
+
+  async getProductViewMetrics(startOfDay: Date, endOfDay: Date) {
+    return prisma.sessionEvent.groupBy({
+      by: ["productId"],
+      where: {
+        eventType: "product_view",
+        timestamp: { gte: startOfDay, lt: endOfDay },
+        productId: { not: null },
+      },
+      _count: {
+        id: true,
+      },
+    });
+  },
+
+  async getTransactionMetrics(startOfDay: Date, endOfDay: Date) {
+    const metrics = await prisma.transaction.groupBy({
+      by: ["paymentStatus"],
+      _count: {
+        id: true,
+      },
+      where: {
+        createdAt: { gte: startOfDay, lt: endOfDay },
+      },
+    });
+
+    const result = {
+      completedTransactions: 0,
+      pendingTransactions: 0,
+      failedTransactions: 0,
+    };
+
+    metrics.forEach((m) => {
+      if (m.paymentStatus === "COMPLETED")
+        result.completedTransactions = m._count.id;
+      if (m.paymentStatus === "PENDING")
+        result.pendingTransactions = m._count.id;
+      if (m.paymentStatus === "FAILED") result.failedTransactions = m._count.id;
+    });
+
+    return result;
+  },
+
+  async getSalesByCountry(from: Date, to: Date) {
+    const metrics = await prisma.dailyMetrics.findMany({
+      where: {
+        date: { gte: from, lte: to },
+      },
+      select: { salesByCountry: true },
+    });
+
+    if (metrics.length > 0) {
+      const consolidated: Record<string, number> = {};
+      metrics.forEach((m) => {
+        const data = m.salesByCountry as Record<string, number> | null;
+        if (data) {
+          Object.entries(data).forEach(([country, sales]) => {
+            consolidated[country] =
+              (consolidated[country] || 0) + Number(sales || 0);
+          });
+        }
+      });
+
+      if (Object.keys(consolidated).length > 0) {
+        return consolidated;
+      }
+    }
+
+    const result = (await prisma.order.aggregateRaw({
+      pipeline: [
+        {
+          $match: {
+            createdAt: {
+              $gte: { $date: from.toISOString() },
+              $lt: { $date: to.toISOString() },
+            },
+            deletedAt: null,
+          },
+        },
+        {
+          $group: {
+            _id: "$country",
+            totalSales: { $sum: "$totalAmount" },
+          },
+        },
+      ],
+    })) as unknown as Array<{ _id: string | null; totalSales: number }>;
+
+    const salesByCountry: Record<string, number> = {};
+    for (const item of result) {
+      const country = item._id || "Other";
+      salesByCountry[country] = Number(item.totalSales || 0);
+    }
+
+    return salesByCountry;
+  },
+
+  async getVisitsByDevice(startOfDay: Date, endOfDay: Date) {
+    const result = await prisma.session.groupBy({
+      by: ["device"],
+      _count: {
+        id: true,
+      },
+      where: {
+        startedAt: { gte: startOfDay, lt: endOfDay },
+        device: { not: null },
+      },
+    });
+
+    const visitsByDevice: Record<string, number> = {};
+    for (const item of result) {
+      if (item.device) {
+        visitsByDevice[item.device] = item._count.id;
+      }
+    }
+
+    return visitsByDevice;
+  },
+
+  async upsertDailyMetrics(
+    date: Date,
+    data: Omit<Prisma.DailyMetricsCreateInput, "date">
+  ) {
+    return prisma.dailyMetrics.upsert({
+      where: { date },
+      update: data,
+      create: {
+        date,
+        ...data,
+      },
+    });
+  },
+
+  async getWeeklyOrderStats({ from, to }: { from: Date; to: Date }) {
+    const [result, countrySales] = await Promise.all([
+      prisma.dailyMetrics.aggregate({
+        _sum: {
+          totalOrders: true,
+          totalSales: true,
+          completedOrders: true,
+          cancelledOrders: true,
+          pendingOrders: true,
+          processingOrders: true,
+          shippedOrders: true,
+          newOrders: true,
+          averageOrderValue: true,
+        },
+        where: {
+          date: { gte: from, lte: to },
+        },
+      }),
+      this.getSalesByCountry(from, to),
+    ]);
+
+    if (result._sum.totalOrders === null) {
+      const orders = await prisma.order.findMany({
+        where: { createdAt: { gte: from, lte: to } },
+      });
+
+      const totalOrders = orders.length;
+      const totalSales = orders.reduce((sum, o) => sum + o.totalAmount, 0);
+      const completedOrders = orders.filter(
+        (o) => o.fulfillmentStatus === "DELIVERED"
+      ).length;
+      const cancelledOrders = orders.filter(
+        (o) => o.fulfillmentStatus === "CANCELED"
+      ).length;
+      const pendingOrders = orders.filter(
+        (o) => o.fulfillmentStatus === "PENDING"
+      ).length;
+
+      return {
+        totalOrders,
+        totalSales,
+        completedOrders,
+        cancelledOrders,
+        pendingOrders,
+        processingOrders: 0,
+        shippedOrders: 0,
+        newOrders: 0,
+        averageOrderValue: totalOrders > 0 ? totalSales / totalOrders : 0,
+        countrySales,
+      };
+    }
+
+    return {
+      totalOrders: result._sum.totalOrders ?? 0,
+      totalSales: result._sum.totalSales ?? 0,
+      completedOrders: result._sum.completedOrders ?? 0,
+      cancelledOrders: result._sum.cancelledOrders ?? 0,
+      pendingOrders: result._sum.pendingOrders ?? 0,
+      processingOrders: result._sum.processingOrders ?? 0,
+      shippedOrders: result._sum.shippedOrders ?? 0,
+      newOrders: result._sum.newOrders ?? 0,
+      averageOrderValue: result._sum.averageOrderValue ?? 0,
+      countrySales,
+    };
+  },
+
+  async getWeeklyCustomerStats({ from, to }: { from: Date; to: Date }) {
+    const aggregate = await prisma.dailyMetrics.aggregate({
+      _sum: {
+        newCustomers: true,
+        returningCustomers: true,
+        totalVisits: true,
+      },
+      where: {
+        date: { gte: from, lte: to },
+      },
+    });
+
+    const latestMetric = await prisma.dailyMetrics.findFirst({
+      where: { date: { gte: from, lte: to } },
+      orderBy: { date: "desc" },
+    });
+
+    if (!latestMetric) {
+      const totalCustomers = await prisma.customer.count({
+        where: { deletedAt: null },
+      });
+      const newCustomers = await prisma.customer.count({
+        where: {
+          deletedAt: null,
+          createdAt: { gte: from, lte: to },
+        },
+      });
+
+      return {
+        newCustomers,
+        returningCustomers: 0,
+        totalVisits: 0,
+        totalCustomers,
+      };
+    }
+
+    const now = new Date();
+    const isRecentRange =
+      Math.abs(now.getTime() - to.getTime()) < 24 * 60 * 60 * 1000;
+
+    const [totalCustomersLive, newCustomersToday] = isRecentRange
+      ? await Promise.all([
+          prisma.customer.count({ where: { deletedAt: null } }),
+          prisma.customer.count({
+            where: {
+              deletedAt: null,
+              createdAt: {
+                gte: new Date(now.setUTCHours(0, 0, 0, 0)),
+              },
+            },
+          }),
+        ])
+      : [null, 0];
+
+    return {
+      newCustomers: (aggregate._sum.newCustomers ?? 0) + newCustomersToday,
+      returningCustomers: aggregate._sum.returningCustomers ?? 0,
+      totalVisits: aggregate._sum.totalVisits ?? 0,
+      totalCustomers: totalCustomersLive ?? latestMetric?.totalCustomers ?? 0,
+    };
+  },
+
+  async getWeeklyTransactionStats({ from, to }: { from: Date; to: Date }) {
+    const result = await prisma.dailyMetrics.aggregate({
+      _sum: {
+        completedTransactions: true,
+        pendingTransactions: true,
+        failedTransactions: true,
+      },
+      where: {
+        date: { gte: from, lte: to },
+      },
+    });
+
+    return {
+      completedTransactions: result._sum.completedTransactions ?? 0,
+      pendingTransactions: result._sum.pendingTransactions ?? 0,
+      failedTransactions: result._sum.failedTransactions ?? 0,
+    };
+  },
+
+  async getWeeklyProductStats({ from, to }: { from: Date; to: Date }) {
+    const latestMetric = await prisma.dailyMetrics.findFirst({
+      where: { date: { gte: from, lte: to } },
+      orderBy: { date: "desc" },
+    });
+
+    if (!latestMetric) {
+      const totalProducts = await prisma.product.count({
+        where: { deletedAt: null },
+      });
+      const inStockProducts = await prisma.product.count({
+        where: { deletedAt: null, stockQuantity: { gt: 0 } },
+      });
+      const outOfStockProducts = await prisma.product.count({
+        where: { deletedAt: null, stockQuantity: { lte: 0 } },
+      });
+
+      return {
+        totalProducts,
+        inStockProducts,
+        outOfStockProducts,
+      };
+    }
+
+    return {
+      totalProducts: latestMetric.totalProducts ?? 0,
+      inStockProducts: latestMetric.inStockProducts ?? 0,
+      outOfStockProducts: latestMetric.outOfStockProducts ?? 0,
+    };
+  },
+
+  async getDailyMetricsInRange({ from, to }: { from: Date; to: Date }) {
+    const metrics = await prisma.dailyMetrics.findMany({
+      where: {
+        date: { gte: from, lte: to },
+      },
+      orderBy: { date: "asc" },
+    });
+
+    const now = new Date();
+    const today = new Date(now.setUTCHours(0, 0, 0, 0));
+
+    // Check if we need to append current day or missing recent days
+    const lastMetricDate =
+      metrics.length > 0
+        ? new Date(metrics[metrics.length - 1]!.date)
+        : new Date(from);
+
+    lastMetricDate.setUTCHours(0, 0, 0, 0);
+
+    const result = [...metrics];
+    const cursor = new Date(lastMetricDate);
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+
+    while (cursor <= today && cursor <= to) {
+      const liveData = await this.getLiveDailyMetricForDate(new Date(cursor));
+      result.push(liveData as any);
+      cursor.setUTCDate(cursor.getUTCDate() + 1);
+    }
+
+    return result;
+  },
+
+  async getLiveDailyMetricForDate(date: Date) {
+    const startOfDay = new Date(date);
+    startOfDay.setUTCHours(0, 0, 0, 0);
+    const endOfDay = new Date(date);
+    endOfDay.setUTCHours(23, 59, 59, 999);
+
+    const [
+      orderMetrics,
+      sessionMetrics,
+      transactionMetrics,
+      productMetrics,
+      newCustomers,
+      salesByCountry,
+      visitsByDevice,
+    ] = await Promise.all([
+      this.getOrderMetrics(startOfDay, endOfDay),
+      this.getSessionMetrics(startOfDay, endOfDay),
+      this.getTransactionMetrics(startOfDay, endOfDay),
+      this.getProductMetrics(),
+      this.getNewCustomersCount(startOfDay, endOfDay),
+      this.getSalesByCountry(startOfDay, endOfDay),
+      this.getVisitsByDevice(startOfDay, endOfDay),
+    ]);
+
+    const totalCustomers = await this.getTotalCustomersCount();
+    const totalVisits = sessionMetrics.totalVisits;
+    const totalOrders = orderMetrics.totalOrders;
+    const conversionRate =
+      totalVisits > 0 ? (totalOrders / totalVisits) * 100 : 0;
+
+    return {
+      date: startOfDay,
+      totalVisits,
+      uniqueVisits: sessionMetrics.uniqueVisits,
+      totalPageViews: sessionMetrics.totalPageViews,
+      totalOrders,
+      totalSales: orderMetrics.totalSales,
+      completedOrders: orderMetrics.completedOrders,
+      pendingOrders: orderMetrics.pendingOrders,
+      shippedOrders: orderMetrics.shippedOrders,
+      processingOrders: orderMetrics.processingOrders,
+      cancelledOrders: orderMetrics.cancelledOrders,
+      averageOrderValue:
+        totalOrders > 0 ? orderMetrics.totalSales / totalOrders : 0,
+      completedTransactions: transactionMetrics.completedTransactions,
+      pendingTransactions: transactionMetrics.pendingTransactions,
+      failedTransactions: transactionMetrics.failedTransactions,
+      conversionRate,
+      cartRate:
+        totalVisits > 0
+          ? (sessionMetrics.addToCartCount / totalVisits) * 100
+          : 0,
+      checkoutRate:
+        totalVisits > 0
+          ? (sessionMetrics.checkoutStartedCount / totalVisits) * 100
+          : 0,
+      purchaseRate: conversionRate,
+      newCustomers,
+      returningCustomers: orderMetrics.returningCustomers,
+      totalCustomers,
+      totalProducts: productMetrics.totalProducts,
+      inStockProducts: productMetrics.inStockProducts,
+      outOfStockProducts: productMetrics.outOfStockProducts,
+      salesByCountry,
+      visitsByDevice,
+    };
+  },
+
+  async getRealTimeStats() {
+    const sessionKeys = await redis.keys("session:*");
+    const activeUsers = sessionKeys.length;
+
+    const thirtyMinutesAgo = new Date(Date.now() - 30 * 60 * 1000);
+
+    const sessionsByMinute = await prisma.session.findMany({
+      where: {
+        startedAt: { gte: thirtyMinutesAgo },
+      },
+      select: { startedAt: true },
+    });
+
+    const minuteCounts = new Array(30).fill(0);
+    const now = Date.now();
+
+    sessionsByMinute.forEach((s) => {
+      const minutesAgo = Math.floor(
+        (now - s.startedAt.getTime()) / (60 * 1000)
+      );
+      if (minutesAgo >= 0 && minutesAgo < 30) {
+        minuteCounts[29 - minutesAgo]++; // Fill from oldest to newest
+      }
+    });
+
+    return {
+      activeUsers,
+      usersPerMinute: minuteCounts,
+    };
+  },
+
+  async getLiveDailyMetric() {
+    const now = new Date();
+    const startOfDay = new Date(now.setUTCHours(0, 0, 0, 0));
+    const endOfDay = new Date(now.setUTCHours(23, 59, 59, 999));
+
+    const [
+      orderMetrics,
+      sessionMetrics,
+      transactionMetrics,
+      productMetrics,
+      newCustomers,
+      salesByCountry,
+      visitsByDevice,
+    ] = await Promise.all([
+      this.getOrderMetrics(startOfDay, endOfDay),
+      this.getSessionMetrics(startOfDay, endOfDay),
+      this.getTransactionMetrics(startOfDay, endOfDay),
+      this.getProductMetrics(),
+      this.getNewCustomersCount(startOfDay, endOfDay),
+      this.getSalesByCountry(startOfDay, endOfDay),
+      this.getVisitsByDevice(startOfDay, endOfDay),
+    ]);
+
+    const totalCustomers = await this.getTotalCustomersCount();
+    const totalVisits = sessionMetrics.totalVisits;
+    const totalOrders = orderMetrics.totalOrders;
+    const conversionRate =
+      totalVisits > 0 ? (totalOrders / totalVisits) * 100 : 0;
+
+    return {
+      date: startOfDay,
+      totalVisits,
+      uniqueVisits: sessionMetrics.uniqueVisits,
+      totalPageViews: sessionMetrics.totalPageViews,
+      totalOrders,
+      totalSales: orderMetrics.totalSales,
+      completedOrders: orderMetrics.completedOrders,
+      pendingOrders: orderMetrics.pendingOrders,
+      shippedOrders: orderMetrics.shippedOrders,
+      processingOrders: orderMetrics.processingOrders,
+      cancelledOrders: orderMetrics.cancelledOrders,
+      averageOrderValue:
+        totalOrders > 0 ? orderMetrics.totalSales / totalOrders : 0,
+      completedTransactions: transactionMetrics.completedTransactions,
+      pendingTransactions: transactionMetrics.pendingTransactions,
+      failedTransactions: transactionMetrics.failedTransactions,
+      conversionRate,
+      cartRate:
+        totalVisits > 0
+          ? (sessionMetrics.addToCartCount / totalVisits) * 100
+          : 0,
+      checkoutRate:
+        totalVisits > 0
+          ? (sessionMetrics.checkoutStartedCount / totalVisits) * 100
+          : 0,
+      purchaseRate: conversionRate,
+      newCustomers,
+      returningCustomers: orderMetrics.returningCustomers,
+      totalCustomers,
+      totalProducts: productMetrics.totalProducts,
+      inStockProducts: productMetrics.inStockProducts,
+      outOfStockProducts: productMetrics.outOfStockProducts,
+      salesByCountry,
+      visitsByDevice,
+    };
+  },
+};
