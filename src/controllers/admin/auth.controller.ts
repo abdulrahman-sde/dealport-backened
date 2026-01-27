@@ -8,6 +8,7 @@ import {
   updateProfileSchema,
   changePasswordSchema,
 } from "../../utils/validators/auth.validator.js";
+import { UnauthorizedError } from "../../utils/errors.js";
 
 export const login = async (req: Request, res: Response): Promise<void> => {
   const validatedData = loginSchema.parse(req.body);
@@ -31,13 +32,15 @@ export const login = async (req: Request, res: Response): Promise<void> => {
 };
 
 export const register = async (req: Request, res: Response): Promise<void> => {
-  const validatedData = registerSchema.parse(req.body);
+  // const validatedData = registerSchema.parse(req.body);
 
-  const result = await adminAuthService.registerUser(validatedData);
+  // const result = await adminAuthService.registerUser(validatedData);
 
-  res
-    .status(201)
-    .json(successResponse(result, "Admin user created successfully"));
+  // res
+  //   .status(201)
+  //   .json(successResponse(result, "Admin user created successfully"));
+
+  throw new UnauthorizedError("Registration is blocked as of now");
 };
 
 export const logout = async (req: Request, res: Response): Promise<void> => {
@@ -93,7 +96,7 @@ export const getMe = async (req: Request, res: Response): Promise<void> => {
 
 export const updateProfile = async (
   req: Request,
-  res: Response
+  res: Response,
 ): Promise<void> => {
   const userId = (req as AuthRequest).user?.id;
   if (!userId) {
@@ -109,7 +112,7 @@ export const updateProfile = async (
 
 export const changePassword = async (
   req: Request,
-  res: Response
+  res: Response,
 ): Promise<void> => {
   const userId = (req as AuthRequest).user?.id;
   if (!userId) {
